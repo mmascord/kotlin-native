@@ -31,7 +31,7 @@ linkerOpts.linux= -fPIC \
      -Wl,-z,noexecstack \
      -lrt -ldl -lpthread -lz -lm
 
-linkerOpts.mingw = -lole32 -luuid -static-libgcc -static-libstdc++ \
+linkerOpts.mingw = -lole32 -luuid -lz -static-libgcc -static-libstdc++ \
     -Wl,-Bstatic,--whole-archive -lwinpthread -Wl,--no-whole-archive,-Bdynamic
 
 # It looks like mingw port compiled without LLVM_ENABLE_DUMP
