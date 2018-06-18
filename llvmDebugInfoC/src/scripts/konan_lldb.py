@@ -33,7 +33,10 @@ def lldb_val_to_ptr(lldb_val):
 
 
 def evaluate(expr):
-    return lldb.debugger.GetSelectedTarget().EvaluateExpression(expr, lldb.SBExpressionOptions())
+    result = lldb.debugger.GetSelectedTarget().EvaluateExpression(expr, lldb.SBExpressionOptions())
+    # TODO: Tracing should be done via standard debugger API.
+    # print("{} => {}".format(expr, result))
+    return result
 
 
 def is_instance_of(addr, typeinfo):
@@ -82,6 +85,17 @@ def select_provider(lldb_val):
     lldb_val) else __FACTORY['object'](lldb_val)
 
 
+_TYPE_NAMES = {0: "invalid",
+               1: "struct ObjHeader *",
+               2: "char",
+               3: "short",
+               4: "int",
+               5: "long",
+               6: "float",
+               7: "double",
+               8: "void *"}
+
+
 class KonanHelperProvider(lldb.SBSyntheticValueProvider):
     def __init__(self, valobj):
         self._target = lldb.debugger.GetSelectedTarget()
@@ -92,6 +106,9 @@ class KonanHelperProvider(lldb.SBSyntheticValueProvider):
             return
         self._children_count = 0
         self._children = []
+        self._children_types = []
+        self._children_type_names = []
+        self._children_type_addresses = []
         self._type_conversion = {0: lambda address, _: "<invalid>{:#x}".format(address),
                                  1: lambda address, _: kotlin_object_type_summary(evaluate("(*(struct ObjHeader **){:#x})".format(address)), {}),
                                  2: lambda address, error: self.__read_memory(address, "<c", 1, error),
@@ -106,12 +123,20 @@ class KonanHelperProvider(lldb.SBSyntheticValueProvider):
     def update(self):
         self._children_count = int(evaluate("(int)Konan_DebugGetFieldCount({})".format(self._ptr)).GetValue())
 
+        self._children_types = [evaluate("(int)Konan_DebugGetFieldType({}, {})".format(self._ptr, child)).GetValueAsUnsigned()
+                                for child in range(self._children_count)]
+        self._children_type_names = [_TYPE_NAMES[typeIndex] for typeIndex in self._children_types]
+        self._children_type_addresses = [int(evaluate("(void *)Konan_DebugGetFieldAddress({}, {})".format(self._ptr, index)).GetValue(), 0) for index in range(self._children_count)]
+
     def _read_string(self, expr, error):
         return self._process.ReadCStringFromMemory(int(evaluate(expr).GetValue(), 0), 0x1000, error)
 
+    def _get_field_type_name(self, index):
+        return self._children_type_names[index]
+
     def _read_value(self, index, error):
-        value_type = evaluate("(int)Konan_DebugGetFieldType({}, {})".format(self._ptr, index)).GetValue()
-        address = int(evaluate("(void *)Konan_DebugGetFieldAddress({}, {})".format(self._ptr, index)).GetValue(), 0)
+        value_type = self._children_types[index]
+        address = self._children_type_addresses[index]
         return self._type_conversion[int(value_type)](address, error)
 
     def __read_memory(self, address, fmt, size, error):
@@ -156,10 +181,15 @@ class KonanStringSyntheticProvider(KonanHelperProvider):
         return self._representation
 
 
+class DebuggerException(Exception):
+    pass
+
+
 class KonanObjectSyntheticProvider(KonanHelperProvider):
     def __init__(self, valobj):
         super(KonanObjectSyntheticProvider, self).__init__(valobj)
         self.update()
+        self._values = []
         pass
 
     def update(self):
@@ -168,6 +198,10 @@ class KonanObjectSyntheticProvider(KonanHelperProvider):
         self._children = [
             self._read_string("(const char *)Konan_DebugGetFieldName({}, (int){})".format(self._ptr, i), error) for i in
             range(0, self._children_count) if error.Success()]
+        self._values = [self._valobj.CreateValueFromExpression(
+            self._children[index],
+            "({})Konan_DebugGetFieldAddress({}, {})".format(self._get_field_type_name(index), self._ptr, index),
+            lldb.SBExpressionOptions()) for index in range(self._children_count)]
 
     def num_children(self):
         return self._children_count
@@ -179,12 +213,11 @@ class KonanObjectSyntheticProvider(KonanHelperProvider):
         return self._children.index(name)
 
     def get_child_at_index(self, index):
-        return evaluate("(void *)Konan_DebugGetFieldAddress({}, {})".format(self._ptr, index)).GetValue()
+        return self._values[index]
 
     def to_string(self):
         error = lldb.SBError()
         return dict([(self._children[i], self._read_value(i, error)) for i in range(0, self._children_count)])
-
 
 
 class KonanArraySyntheticProvider(KonanHelperProvider):
@@ -193,10 +226,15 @@ class KonanArraySyntheticProvider(KonanHelperProvider):
         if self._ptr is None:
             return
         self.update()
+        error = lldb.SBError()
+        self._values = [self._read_value(i, error) for i in range(self._children_count)]
+        if not error.Success():
+            raise DebuggerException()
 
     def update(self):
         super(KonanArraySyntheticProvider, self).update()
         self._children = [x for x in range(0, self.num_children())]
+        self._values = []
 
     def num_children(self):
         return self._children_count
@@ -214,7 +252,7 @@ class KonanArraySyntheticProvider(KonanHelperProvider):
 
     def to_string(self):
         error = lldb.SBError()
-        return [self._read_value(i, error) for i in range(0, self._children_count)]
+        return [self._read_value(i, error) for i in range(self._children_count)]
 
 
 class KonanProxyTypeProvider:
